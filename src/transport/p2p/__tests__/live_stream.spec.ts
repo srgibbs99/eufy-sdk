@@ -105,16 +105,34 @@ describe("LiveStream", () => {
     ]);
   });
 
-  /** A T8200 flags its keyframes `0x40` and its deltas `0x02`, and never sets bit 0. */
-  it("takes a unit flagged 0x40 as a keyframe, and one flagged 0x02 as a delta", () => {
+  /**
+   * A keyless stream (e.g. a standalone T8200) sends plaintext keyframes with header bit 0 clear, so the
+   * keyframe is decided from the payload. Both frames below set flag bit 6 (`0x40`): the opener carries an
+   * H.265 IDR and must be a keyframe, the delta carries no IDR and must stay a delta — proving the decision
+   * is the Annex-B payload, not the flag byte.
+   */
+  it("detects a bit-0-clear keyframe from an IDR in the payload, not from a flag bit", () => {
+    const SC = Buffer.from([0, 0, 0, 1]);
+    // VPS(32)+SPS(33)+PPS(34)+IDR_W_RADL(19) — sniffs as h265 and carries an IDR.
+    const keyframeAu = Buffer.concat([
+      Buffer.from([0x40, 0x01, 0x0c]),
+      SC,
+      Buffer.from([0x42, 0x01, 0x01]),
+      SC,
+      Buffer.from([0x44, 0x01, 0xc0]),
+      SC,
+      Buffer.from([0x26, 0x01, 0xaf]),
+    ]);
+    const deltaAu = Buffer.from([0x02, 0x01, 0xd0]); // TRAIL_R(1) — no IDR
+
     const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
     const { session, live } = mk({ logger });
     const frames: any[] = [];
     live.on("video", (f) => frames.push(f));
     live.start();
 
-    session.push(p2pVideoFrame({ flags: 0x40, nal: Buffer.from([0x40, 0x01, 0x0c]) }));
-    session.push(p2pVideoFrame({ flags: 0x02, nal: Buffer.from([0x02, 0x01]) }));
+    session.push(p2pVideoFrame({ flags: 0x40, nal: keyframeAu }));
+    session.push(p2pVideoFrame({ flags: 0x40, nal: deltaAu }));
 
     expect(frames.map((f) => f.keyframe)).toEqual([true, false]);
     expect(frames.map((f) => f.codec)).toEqual(["h265", "h265"]);

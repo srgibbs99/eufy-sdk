@@ -21,6 +21,7 @@
  * capture. The frame layout is the block comment above.
  */
 import { createDecipheriv } from "node:crypto";
+import { hasIdr, sniffAnnexbCodec } from "./annexb.js";
 import { eciesUnwrap } from "./codec.js";
 
 /** AAD used for the AES-256-GCM body cipher of every video frame, and of a recording's audio. */
@@ -310,21 +311,23 @@ function beginsAccessUnit(body: Buffer): boolean {
 }
 
 /**
- * Flag bit 6 at 0x04: set on a T8200's keyframes, whose media key is RSA-wrapped rather than carried in an
- * ECIES envelope, so bit 0 stays clear on them. Measured on a standalone T8200: every unit opening with
- * VPS/SPS/PPS/IDR carried `0x40`, every delta `0x02`, and none set bit 0.
- */
-const KEYFRAME_FLAG_RSA_WRAPPED = 0x40;
-
-/**
- * The delivered shape of a unit: its header's flags and geometry, and the payload as assembled. The unit is a
- * keyframe when its header sets bit 0 or {@link KEYFRAME_FLAG_RSA_WRAPPED}; {@link VideoFrameHeader.keyframe}
- * keeps meaning bit 0 alone, the ECIES envelope {@link VideoFrameDecoder} unwraps.
+ * The delivered shape of a unit: its header's flags and geometry, and the payload as assembled.
+ *
+ * {@link VideoFrameHeader.keyframe} is header bit 0, which marks a keyframe that carries the ECIES-wrapped
+ * media key {@link VideoFrameDecoder} unwraps. A keyless stream (e.g. a standalone T8200) sends plaintext
+ * keyframes with bit 0 clear, so when it is clear the keyframe is decided from the assembled Annex-B itself —
+ * a real IDR via {@link hasIdr}, the same payload check `rtc/live.ts` uses. `data` is the decrypted bitstream
+ * by here, and a delta carries no IDR, so this never promotes a P-frame whatever its header flags are.
  */
 function unitOf(header: VideoFrameHeader, data: Buffer): AssembledAccessUnit {
+  let keyframe = header.keyframe;
+  if (!keyframe) {
+    const codec = sniffAnnexbCodec(data);
+    keyframe = codec !== undefined && hasIdr(data, codec);
+  }
   return {
     sourceTimestamp: header.timestamp,
-    keyframe: header.keyframe || (header.flags & KEYFRAME_FLAG_RSA_WRAPPED) !== 0,
+    keyframe,
     width: header.width,
     height: header.height,
     data,
