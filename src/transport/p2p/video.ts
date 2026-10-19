@@ -175,7 +175,7 @@ export class VideoFrameDecoder {
 export interface AssembledAccessUnit {
   /** Unsigned 32-bit header timestamp from the first frame of this access unit. */
   sourceTimestamp: number;
-  /** True when the unit's own header flagged it a keyframe — a point a consumer may begin decoding at. */
+  /** True when header bit 0 is set, or (bit 0 clear) the payload contains an IDR — a point to begin decoding at. */
   keyframe: boolean;
   /** Frame width the unit's header declared. */
   width: number;
@@ -311,23 +311,18 @@ function beginsAccessUnit(body: Buffer): boolean {
 }
 
 /**
- * The delivered shape of a unit: its header's flags and geometry, and the payload as assembled.
- *
- * {@link VideoFrameHeader.keyframe} is header bit 0, which marks a keyframe that carries the ECIES-wrapped
- * media key {@link VideoFrameDecoder} unwraps. A keyless stream (e.g. a standalone T8200) sends plaintext
- * keyframes with bit 0 clear, so when it is clear the keyframe is decided from the assembled Annex-B itself —
- * a real IDR via {@link hasIdr}, the same payload check `rtc/live.ts` uses. `data` is the decrypted bitstream
- * by here, and a delta carries no IDR, so this never promotes a P-frame whatever its header flags are.
+ * The delivered shape of a unit: its header's geometry and the payload as assembled, with the keyframe
+ * decided as: header bit 0 set, or — when it is clear — the assembled Annex-B sniffs a codec and contains
+ * an IDR NAL ({@link hasIdr}, the same payload check `rtc/live.ts` uses). `data` is the decrypted bitstream
+ * by here, and a delta carries no IDR, so a P-frame is never promoted whatever its header flags. (Measured:
+ * a standalone T8200 flags its keyframes `0x40` and its deltas `0x02`, neither setting bit 0 — the IDR
+ * check catches the keyframe that bit 0 misses, without reading `0x40` as a keyframe bit on any model.)
  */
 function unitOf(header: VideoFrameHeader, data: Buffer): AssembledAccessUnit {
-  let keyframe = header.keyframe;
-  if (!keyframe) {
-    const codec = sniffAnnexbCodec(data);
-    keyframe = codec !== undefined && hasIdr(data, codec);
-  }
+  const codec = header.keyframe ? undefined : sniffAnnexbCodec(data);
   return {
     sourceTimestamp: header.timestamp,
-    keyframe,
+    keyframe: header.keyframe || (codec !== undefined && hasIdr(data, codec)),
     width: header.width,
     height: header.height,
     data,

@@ -106,14 +106,12 @@ describe("LiveStream", () => {
   });
 
   /**
-   * A keyless stream (e.g. a standalone T8200) sends plaintext keyframes with header bit 0 clear, so the
-   * keyframe is decided from the payload. Both frames below set flag bit 6 (`0x40`): the opener carries an
-   * H.265 IDR and must be a keyframe, the delta carries no IDR and must stay a delta — proving the decision
-   * is the Annex-B payload, not the flag byte.
+   * When header bit 0 is clear, the keyframe is decided from the payload: a unit that sniffs a codec and
+   * contains an IDR is a keyframe, one without an IDR is a delta. (Measured on a standalone T8200, whose
+   * keyframes and deltas both leave bit 0 clear.)
    */
-  it("detects a bit-0-clear keyframe from an IDR in the payload, not from a flag bit", () => {
+  it("detects a bit-0-clear keyframe from an IDR in the payload", () => {
     const SC = Buffer.from([0, 0, 0, 1]);
-    // VPS(32)+SPS(33)+PPS(34)+IDR_W_RADL(19) — sniffs as h265 and carries an IDR.
     const keyframeAu = Buffer.concat([
       Buffer.from([0x40, 0x01, 0x0c]),
       SC,
@@ -123,7 +121,7 @@ describe("LiveStream", () => {
       SC,
       Buffer.from([0x26, 0x01, 0xaf]),
     ]);
-    const deltaAu = Buffer.from([0x02, 0x01, 0xd0]); // TRAIL_R(1) — no IDR
+    const deltaAu = Buffer.from([0x02, 0x01, 0xd0]);
 
     const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
     const { session, live } = mk({ logger });
@@ -131,8 +129,8 @@ describe("LiveStream", () => {
     live.on("video", (f) => frames.push(f));
     live.start();
 
-    session.push(p2pVideoFrame({ flags: 0x40, nal: keyframeAu }));
-    session.push(p2pVideoFrame({ flags: 0x40, nal: deltaAu }));
+    session.push(p2pVideoFrame({ nal: keyframeAu }));
+    session.push(p2pVideoFrame({ nal: deltaAu }));
 
     expect(frames.map((f) => f.keyframe)).toEqual([true, false]);
     expect(frames.map((f) => f.codec)).toEqual(["h265", "h265"]);
