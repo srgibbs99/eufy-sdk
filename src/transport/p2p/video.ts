@@ -311,12 +311,10 @@ function beginsAccessUnit(body: Buffer): boolean {
 }
 
 /**
- * The delivered shape of a unit: its header's geometry and the payload as assembled, with the keyframe
+ * The delivered shape of a unit: its header's geometry and the payload as assembled. The keyframe is
  * decided as: header bit 0 set, or — when it is clear — the assembled Annex-B sniffs a codec and contains
- * an IDR NAL ({@link hasIdr}, the same payload check `rtc/live.ts` uses). `data` is the decrypted bitstream
- * by here, and a delta carries no IDR, so a P-frame is never promoted whatever its header flags. (Measured:
- * a standalone T8200 flags its keyframes `0x40` and its deltas `0x02`, neither setting bit 0 — the IDR
- * check catches the keyframe that bit 0 misses, without reading `0x40` as a keyframe bit on any model.)
+ * an IDR NAL (via {@link hasIdr}). `data` is the decrypted bitstream by here, and a delta carries no IDR,
+ * so a P-frame is never promoted whatever its header flags.
  */
 function unitOf(header: VideoFrameHeader, data: Buffer): AssembledAccessUnit {
   const codec = header.keyframe ? undefined : sniffAnnexbCodec(data);
