@@ -310,12 +310,7 @@ function beginsAccessUnit(body: Buffer): boolean {
   return body[2] === 1 || (body[2] === 0 && body[3] === 1);
 }
 
-/**
- * The delivered shape of a unit: its header's geometry and the payload as assembled. The keyframe is
- * decided as: header bit 0 set, or — when it is clear — the assembled Annex-B sniffs a codec and contains
- * an IDR NAL (via {@link hasIdr}). `data` is the decrypted bitstream by here, and a delta carries no IDR,
- * so a P-frame is never promoted whatever its header flags.
- */
+/** Assemble the delivered unit; `keyframe` is resolved per {@link AssembledAccessUnit.keyframe}. */
 function unitOf(header: VideoFrameHeader, data: Buffer): AssembledAccessUnit {
   const codec = header.keyframe ? undefined : sniffAnnexbCodec(data);
   return {

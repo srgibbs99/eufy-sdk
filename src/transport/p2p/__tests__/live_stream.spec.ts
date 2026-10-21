@@ -107,8 +107,7 @@ describe("LiveStream", () => {
 
   /**
    * When header bit 0 is clear, the keyframe is decided from the payload: a unit that sniffs a codec and
-   * contains an IDR is a keyframe, one without an IDR is a delta. (Measured on a standalone T8200, whose
-   * keyframes and deltas both leave bit 0 clear.)
+   * contains an IDR is a keyframe, one without an IDR is a delta.
    */
   it("detects a bit-0-clear keyframe from an IDR in the payload", () => {
     const SC = Buffer.from([0, 0, 0, 1]);
