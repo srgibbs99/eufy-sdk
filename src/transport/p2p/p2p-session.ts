@@ -2109,9 +2109,13 @@ export class P2PSession extends EventEmitter {
     endDate: string;
     startTime?: string;
     count?: number;
+    timeoutMs?: number;
+    signal?: AbortSignal;
   }): Promise<unknown[]> {
     return this.readDatabase("history_record_info", {
       accountId: opts.accountId,
+      timeoutMs: opts.timeoutMs,
+      signal: opts.signal,
       innerCmd: DB_QUERY.QUERY_LOCAL,
       query: {
         count: opts.count ?? 20,

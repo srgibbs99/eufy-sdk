@@ -96,6 +96,8 @@ import type {
   RealtimeReadiness,
   StationFace,
   StationFacesOptions,
+  StationRecord,
+  StationRecordsOptions,
   WaitForRealtimeOptions,
 } from "./types.js";
 
@@ -109,6 +111,8 @@ export type {
   RealtimeReadiness,
   StationFace,
   StationFacesOptions,
+  StationRecord,
+  StationRecordsOptions,
   WaitForRealtimeOptions,
 } from "./types.js";
 
@@ -126,6 +130,42 @@ function recordString(raw: Record<string, unknown>, key: string): string | undef
   const nested = (raw.deviceParams as Record<string, unknown> | undefined)?.[key];
   const v = typeof nested === "string" && nested ? nested : raw[key];
   return typeof v === "string" && v ? v : undefined;
+}
+
+/**
+ * Rows asked per `history_record_info` page. A station answers up to 50, but a full 50-row reply spans enough
+ * datagrams that it intermittently never arrives whole; 20-row pages do.
+ */
+const RECORD_PAGE_ROWS = 20;
+
+/** How long one record page has to arrive whole, when the caller states no bound. */
+const RECORD_PAGE_TIMEOUT_MS = 5_000;
+
+/** How many times one record page is asked before the read gives up. */
+const RECORD_PAGE_ATTEMPTS = 3;
+
+/** A local calendar day as `yyyyMMdd`. */
+function yyyymmdd(d: Date): string {
+  return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/** The `yyyyMMdd` day `days` after `day` (before it when negative). */
+function shiftDay(day: string, days: number): string {
+  const d = new Date(Number(day.slice(0, 4)), Number(day.slice(4, 6)) - 1, Number(day.slice(6, 8)) + days);
+  return yyyymmdd(d);
+}
+
+/**
+ * The `history_record_info` rows of a record page. The page groups them with companion tables, each group
+ * `{table_name, payload}`; a group that is not that table, or a row that is not an object, is skipped.
+ */
+function recordRowsOf(groups: unknown[]): StationRecord[] {
+  const group = groups.find(
+    (g): g is { payload: unknown } =>
+      typeof g === "object" && g !== null && (g as { table_name?: unknown }).table_name === "history_record_info",
+  );
+  const payload = Array.isArray(group?.payload) ? group.payload : [];
+  return payload.filter((row): row is StationRecord => typeof row === "object" && row !== null);
 }
 
 /** The owning member's `admin_user_id` off a raw device record, which its station scopes writes to. */
@@ -2102,17 +2142,88 @@ export class EufyMega extends EventEmitter {
    * returned as they arrive; a caller that wants only named people filters them.
    */
   async getStationFaces(stationSn: string, opts: StationFacesOptions = {}): Promise<StationFace[]> {
-    if (!this.registry.list().length) await this.getDevices();
-    const station = this.p2p.stationKeyOf(stationSn);
-    const accountId = this.adminUserIdOf(station);
-    if (!accountId) throw new Error(`getStationFaces: no admin_user_id on record for ${station}`);
-
-    await this.p2p.ensureStation(station, opts.signal);
-    const session = this.p2p.getSessions().get(station);
-    if (!session) throw new Error(`getStationFaces: no P2P session for ${station}`);
-
+    const { session, accountId } = await this.stationDatabase(stationSn, "getStationFaces", opts.signal);
     const rows = await session.readDatabase("person_basic_info", { accountId, ...opts });
     return rows.filter((row): row is StationFace => typeof row === "object" && row !== null);
+  }
+
+  /**
+   * The recordings a device's station keeps on its own storage, newest first, read from its
+   * `history_record_info` table over P2P with the local-records query the eufy app lists event history with.
+   *
+   * The station treats the query's end date as exclusive, so this asks up to the day after `endDate`, and pages
+   * back 20 rows at a time from the oldest row's `start_time` until a page brings no new `record_id` or
+   * `limit` rows are in hand. Rows naming another device are left out; rows naming none are
+   * kept.
+   *
+   * A page reply intermittently never arrives whole, so a page is asked up to three times, each given
+   * `timeoutMs` (default 5s; a 20-row page arrives in well under one).
+   *
+   * Rejects as {@link getStationFaces} does: on a station that cannot be reached, on a record stating no
+   * `admin_user_id`, and on a page not arriving whole on its last attempt. An aborted `signal` rejects at
+   * once.
+   */
+  async getStationRecords(deviceSn: string, opts: StationRecordsOptions = {}): Promise<StationRecord[]> {
+    const { session, accountId } = await this.stationDatabase(deviceSn, "getStationRecords", opts.signal);
+    const endDate = opts.endDate ?? yyyymmdd(new Date());
+    const startDate = opts.startDate ?? shiftDay(endDate, -6);
+    const limit = opts.limit ?? 500;
+    const rows = new Map<unknown, StationRecord>();
+    let startTime = "0";
+    while (rows.size < limit) {
+      const query = {
+        accountId,
+        startDate,
+        endDate: shiftDay(endDate, 1),
+        startTime,
+        count: RECORD_PAGE_ROWS,
+        timeoutMs: opts.timeoutMs ?? RECORD_PAGE_TIMEOUT_MS,
+        signal: opts.signal,
+      };
+      let groups: unknown[] | undefined;
+      for (let attempt = 1; !groups; attempt++) {
+        try {
+          groups = await session.queryRecordPage(query);
+        } catch (e) {
+          if (opts.signal?.aborted || attempt >= RECORD_PAGE_ATTEMPTS) throw e;
+        }
+      }
+      const page = recordRowsOf(groups);
+      const fresh = page.filter((row) => !rows.has(row.record_id ?? row));
+      for (const row of fresh) rows.set(row.record_id ?? row, row);
+      const oldest = page.at(-1)?.start_time;
+      if (!fresh.length || page.length < RECORD_PAGE_ROWS || typeof oldest !== "string") break;
+      startTime = oldest.replace(/\D/g, "");
+    }
+    return [...rows.values()]
+      .filter((row) => row.device_sn === undefined || row.device_sn === deviceSn)
+      .sort(
+        (a, b) =>
+          String(b.start_time ?? "").localeCompare(String(a.start_time ?? "")) ||
+          (b.record_id ?? 0) - (a.record_id ?? 0),
+      )
+      .slice(0, limit);
+  }
+
+  /**
+   * The P2P session and account id a database read on `sn`'s station needs, with the station connected.
+   * Throws, naming `caller`, when the record states no `admin_user_id` (the station answers a query without
+   * one `-104`) or when no session comes up.
+   */
+  private async stationDatabase(
+    sn: string,
+    caller: string,
+    signal?: AbortSignal,
+  ): Promise<{ session: P2PSession; accountId: string }> {
+    if (!this.registry.list().length) await this.getDevices();
+    const station = this.p2p.stationKeyOf(sn);
+    const accountId = this.adminUserIdOf(station);
+    if (!accountId) throw new Error(`${caller}: no admin_user_id on record for ${station}`);
+
+    await this.p2p.ensureStation(station, signal);
+    const session = this.p2p.getSessions().get(station);
+    if (!session) throw new Error(`${caller}: no P2P session for ${station}`);
+    return { session, accountId };
   }
 
   /** The station's own `admin_user_id`, which its database refuses the query without. */

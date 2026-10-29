@@ -255,6 +255,35 @@ export interface StationFacesOptions {
 }
 
 /**
+ * One recording a station keeps on its own storage: a row of its `history_record_info` table, the list
+ * the eufy app shows as a device's event history.
+ *
+ * Times are the station's own wall clock, `yyyy-MM-dd HH:mm:ss` with no zone. `storage_path` is the
+ * recording on the station, `thumb_path` its cover image (a path `P2PSession.requestImage` takes). As with
+ * {@link StationFace}, every field is optional and unrecognised columns are kept verbatim.
+ */
+export interface StationRecord {
+  record_id?: number;
+  device_sn?: string;
+  start_time?: string;
+  end_time?: string;
+  storage_path?: string;
+  thumb_path?: string;
+  trigger_type?: number;
+  [column: string]: unknown;
+}
+
+/** Which days of a station's recordings to read, and how many at most. */
+export interface StationRecordsOptions extends StationFacesOptions {
+  /** First day, `yyyyMMdd` on the station's calendar. Default: six days before `endDate`. */
+  startDate?: string;
+  /** Last day, inclusive, `yyyyMMdd`. Default: today on this host's calendar. */
+  endDate?: string;
+  /** Stop once this many rows are in hand. Default 500. */
+  limit?: number;
+}
+
+/**
  * A single semantic event tagged with its name — the payload of the catch-all `"event"` listener.
  * A discriminated union over {@link DeviceEventMap}, so switching on `e.eventName` narrows `e` to that
  * event's payload.
