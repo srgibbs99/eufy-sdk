@@ -1,5 +1,6 @@
 import { createCipheriv } from "node:crypto";
-import { decodeImageV1, isV1Image, getImageKey, normalizePushImage, V1_PREFIX } from "../decodeImageV1.js";
+import { decodeImageV1, isV1Image, normalizePushImage, V1_PREFIX } from "../decodeImageV1.js";
+import { getImageKey } from "../../../core/image-key.js";
 
 /** A synthetic v1 wrapper with the production-verified framing and key derivation. */
 const SERIAL = "T8010P1234567890";

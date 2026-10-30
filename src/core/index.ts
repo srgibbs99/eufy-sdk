@@ -1,4 +1,5 @@
 export * from "./crypto.js";
+export * from "./image-key.js";
 export * from "./types.js";
 export * from "./contracts.js";
 export * from "./raw-dp-writer.js";

@@ -1,7 +1,18 @@
 import { randomBytes } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import type { P2PRouterDeps } from "../command-router.js";
-import { IDR, camera, keyframe, plainFrame, slice } from "./recording-fixtures.js";
+import {
+  IDR,
+  LONG_IDR,
+  STANDALONE,
+  camera,
+  downloadReply,
+  keyframe,
+  plainFrame,
+  sealedFrame,
+  slice,
+} from "./recording-fixtures.js";
+import { standaloneRecordingKey } from "../recording-download.js";
 import { ACCOUNT_ID, DEVICE_SN, STATION_SN, connectedSession, routerWithSession } from "./session-fixtures.js";
 
 const RECORDING = "20260101120000";
@@ -176,6 +187,81 @@ describe("recording download through the router", () => {
     const { media, sent } = homeBase2();
 
     await expect(media.downloadRecording!({ recording: RECORDING, cipherId: CIPHER_ID + 1 })).rejects.toMatchObject({
+      reason: "key-unavailable",
+    });
+    expect(sent).toHaveLength(0);
+  });
+});
+
+describe("standalone doorbell recording download through the router", () => {
+  const NAME = "h264_video_20260101_120000";
+
+  /**
+   * A router over a fake cipher-0 standalone doorbell of `model` that answers a download request with its
+   * reply on channel 0, a sealed keyframe and a plain frame on channel 1, then the finish frame on channel 0.
+   */
+  function doorbell(model = "T8201", p2pDid: string = STANDALONE.p2pDid) {
+    const session = connectedSession(false);
+    const sent: unknown[][] = [];
+    const key = standaloneRecordingKey(STANDALONE.serial, STANDALONE.p2pDid, STANDALONE.code);
+    const emit = (frame: { commandId: number; signCode: number; raw: Buffer }, channel: number, dataType = 3) =>
+      session.emit("data", { ...frame, data: frame.raw, dataType, channel });
+    Object.assign(session, {
+      sendStringPairCommand: vi.fn((...args: unknown[]) => {
+        sent.push(args);
+        setTimeout(() => emit(downloadReply(), 0, 0), 2);
+        setTimeout(() => emit(sealedFrame(key, LONG_IDR, 0, 0), 1), 5);
+        setTimeout(() => {
+          emit(plainFrame(slice(1), 1, 67), 1);
+          session.emit("data", { commandId: 1304, dataType: 2, signCode: 0, raw: Buffer.alloc(0), channel: 0 });
+        }, 25);
+      }),
+    });
+    const listDevices = () =>
+      [
+        {
+          sn: STANDALONE.serial,
+          stationSn: STANDALONE.serial,
+          model,
+          p2pDid,
+          raw: { member: { admin_user_id: ACCOUNT_ID } },
+        },
+      ] as never;
+    const router = routerWithSession(session, { register: false, deps: { listDevices } });
+    (router as unknown as { manager: { register(sn: string, value: unknown): void } }).manager.register(
+      STANDALONE.serial,
+      session,
+    );
+    return { media: router.mediaProviderFor(STANDALONE.serial), sent };
+  }
+
+  it("requests the doorbell's own path as the station admin and opens it with the reply's code", async () => {
+    const { media, sent } = doorbell();
+
+    const out = await media.downloadRecording!({ recording: NAME, cipherId: 1 });
+
+    expect(sent).toEqual([[1024, `/mnt/userdata/video/${NAME}.data`, ACCOUNT_ID, 0]]);
+    expect(out.video).toEqual(Buffer.concat([LONG_IDR, slice(1)]));
+    expect(out.frames).toBe(2);
+  });
+
+  it("offers no download on a standalone model whose recording download is unconfirmed", () => {
+    expect(doorbell("T8134").media.downloadRecording).toBeUndefined();
+  });
+
+  it("refuses a HomeBase 2 recording name", async () => {
+    const { media, sent } = doorbell();
+
+    await expect(media.downloadRecording!({ recording: "20260101120000", cipherId: 1 })).rejects.toMatchObject({
+      reason: "invalid-recording",
+    });
+    expect(sent).toHaveLength(0);
+  });
+
+  it("refuses when the doorbell's record states no p2p_did", async () => {
+    const { media, sent } = doorbell("T8201", "");
+
+    await expect(media.downloadRecording!({ recording: NAME, cipherId: 1 })).rejects.toMatchObject({
       reason: "key-unavailable",
     });
     expect(sent).toHaveLength(0);

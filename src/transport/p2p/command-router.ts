@@ -63,8 +63,10 @@ import { freshestLanIp } from "./lan-ip.js";
 import { captureSnapshotFromShared, recordClip } from "./media.js";
 import {
   decodeRecording,
+  decodeStandaloneRecording,
   homeBase2RecordingPath,
   receiveRecording,
+  standaloneRecordingPath,
   type RecordingTransfer,
 } from "./recording-download.js";
 import type { FfmpegLevel } from "../ffmpeg.js";
@@ -132,6 +134,12 @@ const RTSP_URL_READ_TIMEOUT_MS = 12_000;
  * nothing ends with its source's warm-up deadline.
  */
 const TALKBACK_CODEC_WAIT_MS = 3000;
+
+/**
+ * Standalone models whose recording download is confirmed on a device: its path layout, the request in the
+ * clear on its cipher-0 session, and the frames {@link decodeStandaloneRecording} reads.
+ */
+const STANDALONE_RECORDING_MODELS: ReadonlySet<string> = new Set(["T8201"]);
 
 /** Models whose speaker plays `aac-eld` talkback; every other model talks `aac-lc`. */
 const ELD_TALKBACK_MODELS: ReadonlySet<string> = new Set(["T8410C"]);
@@ -842,14 +850,15 @@ export class P2PCommandRouter {
   }
 
   /**
-   * Whether `sn` is a camera attached to a HomeBase 2 (T8010), the one station whose recording path layout
-   * and frame formats are confirmed.
+   * Whether `sn` is a camera whose recording path layout and frame formats are confirmed: one attached to a
+   * HomeBase 2 (T8010), or a standalone model in {@link STANDALONE_RECORDING_MODELS}.
    */
   private downloadsRecordings(sn: string): boolean {
     const dev = this.recordFor(sn);
     if (!dev) return false;
     const parentSn = stationOf(dev);
-    return parentSn !== sn && this.recordFor(parentSn)?.model === "T8010";
+    if (parentSn === sn) return STANDALONE_RECORDING_MODELS.has(dev.model ?? "");
+    return this.recordFor(parentSn)?.model === "T8010";
   }
 
   /**
@@ -892,6 +901,7 @@ export class P2PCommandRouter {
     opts: RecordingDownloadOpts,
   ): Promise<{ recording: Promise<RecordingDownload>; drained: Promise<void> }> {
     const { session, parentSn, channel, accountId } = await this.resolveSession(sn, { signal: opts.signal });
+    if (parentSn === sn) return this.startStandaloneRecordingDownload(session, sn, channel, accountId, opts);
     const path = homeBase2RecordingPath(channel, opts.recording);
     if (!path) throw new RecordingDownloadError("invalid-recording", `no recording named ${opts.recording}`);
     const eccKey = (await this.cipherKeysFor(session, opts.cipherId, accountId, parentSn))?.ecc;
@@ -906,6 +916,37 @@ export class P2PCommandRouter {
       signal: opts.signal,
     });
     return { recording: transfer.frames.then((frames) => decodeRecording(frames, eccKey)), drained: transfer.drained };
+  }
+
+  /**
+   * Start one download from a standalone doorbell. Its key comes with the transfer, from the download code in
+   * the doorbell's reply and the station's `p2p_did` ({@link decodeStandaloneRecording}), so `cipherId` is not
+   * read. The doorbell tags the transfer with a channel of its own, so frames on any channel are taken.
+   */
+  private startStandaloneRecordingDownload(
+    session: P2PSession,
+    sn: string,
+    channel: number,
+    accountId: string,
+    opts: RecordingDownloadOpts,
+  ): { recording: Promise<RecordingDownload>; drained: Promise<void> } {
+    const path = standaloneRecordingPath(opts.recording);
+    if (!path) throw new RecordingDownloadError("invalid-recording", `no recording named ${opts.recording}`);
+    const dev = this.recordFor(sn);
+    const p2pDid = (dev?.p2pDid ?? (dev?.raw as Record<string, unknown> | undefined)?.p2p_did) as string | undefined;
+    if (!p2pDid) throw new RecordingDownloadError("key-unavailable", `no p2p_did on record for ${sn}`);
+    const transfer = receiveRecording(session, {
+      path,
+      accountId,
+      channel,
+      anyChannel: true,
+      timeoutMs: opts.timeoutMs,
+      signal: opts.signal,
+    });
+    return {
+      recording: transfer.frames.then((frames) => decodeStandaloneRecording(frames, sn, p2pDid)),
+      drained: transfer.drained,
+    };
   }
 
   /**

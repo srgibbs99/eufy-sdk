@@ -228,3 +228,33 @@ describe("database reads on a cipher-0 session", () => {
     expect(chunks).toEqual([]);
   });
 });
+
+describe("a recording download request on a cipher-0 session", () => {
+  beforeEach(() => void vi.useFakeTimers());
+  afterEach(() => void vi.useRealTimers());
+
+  const PATH = "/mnt/userdata/video/h264_video_20260101_000000.data";
+
+  it("sends the path and account in the clear, on the shared counter", () => {
+    const { session: s, sent } = session();
+    negotiate(s, 0);
+    s.queryDatabase("history_record_info", { accountId: ACCOUNT_ID, innerCmd: 10013, channel: 0 });
+    s.sendStringPairCommand(1024, PATH, ACCOUNT_ID, 0);
+
+    const request = commandOf(sent[1]);
+    expect(request).toMatchObject({ command: 1024, counter: [0x01, 0x02], channel: 0, signCode: 0, frameType: 0 });
+    expect(request.body.subarray(0, 5)).toEqual(Buffer.alloc(5));
+    expect(request.body.subarray(5, 133).toString("latin1").replace(/\0+$/, "")).toBe(PATH);
+    expect(request.body.subarray(133, 261).toString("latin1").replace(/\0+$/, "")).toBe(ACCOUNT_ID);
+  });
+
+  it("stays level-1 on a session whose gateway names another cipher", () => {
+    const { session: s, sent } = session();
+    negotiate(s, 1);
+    s.sendStringPairCommand(1024, PATH, ACCOUNT_ID, 0);
+
+    const request = commandOf(sent[0]);
+    expect(request).toMatchObject({ command: 1024, signCode: 1 });
+    expect(request.body.includes(Buffer.from(PATH))).toBe(false);
+  });
+});

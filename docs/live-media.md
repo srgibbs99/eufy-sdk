@@ -368,7 +368,7 @@ collects its decode burst, and detaches before decoding. The JPEG decode uses ff
 convenience sink, resolved on `PATH` or configured with `ffmpegPath`. Raw frames remain available
 through `openReadable` and the event stream.
 
-## Recordings stored on a HomeBase 2
+## Recordings stored on a HomeBase 2 or a doorbell
 
 A HomeBase 2 (T8010) keeps each event recording of its attached cameras, and names it in the event push:
 `payload.p` is the recording name and `cipher` the key id it was stored under. `downloadRecording`
@@ -402,8 +402,14 @@ AAC-LC in ADTS framing. `fps` and `durationMs` come from the camera's own frame 
 counts frames the camera numbered that never arrived. Muxing is the caller's; for example with ffmpeg,
 `-framerate <fps> -f h264 -i video.h264 -f aac -i audio.aac -c copy clip.mp4`.
 
-The download is confirmed on a HomeBase 2 only, so `downloadRecording` is absent on a camera attached to
-any other station. A transfer that ends without the station's finish frame (it went quiet, ran past
+A standalone wired doorbell (T8201) keeps its event recordings on itself. Each row of its own recording
+archive (`P2PSession.queryRecordPage`) names one in `storage_path`; the recording name is that file's name
+without its `.data` extension, `h264_video_yyyyMMdd_HHmmss`, and any other name is refused as
+`invalid-recording`. The doorbell sends the key with the transfer, so `cipherId` is not read for it. Its
+`video` is Annex-B H.264 and its `audio` AAC-LC in ADTS framing, as above; a 16 s recording took about 3 s.
+
+The download is confirmed on a HomeBase 2 and on a standalone T8201 only, so `downloadRecording` is absent on
+any other camera. A transfer that ends without the station's finish frame (it went quiet, ran past
 `timeoutMs`, or reached the size ceiling) rejects with reason `incomplete` rather than returning a partial
 recording.
 
