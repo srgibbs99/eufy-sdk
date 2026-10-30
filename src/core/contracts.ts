@@ -941,8 +941,10 @@ export interface MediaProvider {
   talkback?(opts?: { encoder?: AacEncoder } & SharedSourceHints): Promise<TalkbackHandle>;
   /**
    * Download one recording the camera's station stored, identified by the recording name and cipher id of
-   * the event. One download runs at a time per station. Rejects with {@link RecordingDownloadError}.
-   * Optional, and absent on a camera whose station's recording download is unverified.
+   * the event. A HomeBase 2 names it `yyyyMMddHHmmss` or `h265_yyyyMMddHHmmss`; a standalone doorbell names it
+   * `h264_video_yyyyMMdd_HHmmss` and sends its key with the transfer, so `cipherId` is not read for it. One
+   * download runs at a time per station. Rejects with {@link RecordingDownloadError}. Optional, and absent on
+   * a camera whose station's recording download is unverified.
    */
   downloadRecording?(
     opts: { recording: string; cipherId: number; timeoutMs?: number } & AbortableCall,

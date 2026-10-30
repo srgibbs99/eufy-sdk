@@ -1,5 +1,6 @@
 /**
- * Download of a recording held on a HomeBase 2 (T8010), over the station's P2P session.
+ * Download of a recording held on a HomeBase 2 (T8010) or on a standalone doorbell, over the station's P2P
+ * session.
  *
  * The request is `CMD_DOWNLOAD_VIDEO` (1024) in the string-pair shape
  * ({@link buildStringPairCommandPayload}) on the camera's channel. The station answers on
@@ -18,18 +19,38 @@
  *   plaintext is a whole ADTS frame, header included
  * ```
  *
+ * A standalone doorbell answers the request in the clear on a cipher-0 session, and differently:
+ *
+ * ```
+ * reply to 1024, channel 0: i32@0 = result (0 = accepted), then a 10-digit ASCII download code
+ * frames: on a channel of the doorbell's own, not the request's
+ * video, signCode 1: 22B header, then len bytes whose first 128 are AES-128-ECB under the download key
+ *   ({@link standaloneRecordingKey}), the rest plaintext H.264; length = 22 + len exactly
+ * video, signCode 0: 22B header, then len bytes of plaintext H.264
+ * audio: 16B header (as above), then len bytes of plaintext AAC, a whole ADTS frame
+ * ```
+ *
  * @module p2p/recording-download
  */
 import { createDecipheriv } from "node:crypto";
+import { getImageKey } from "../../core/image-key.js";
 import { RecordingDownloadError, type RecordingDownload } from "../../core/contracts.js";
 import { CommandType } from "./commands.js";
 import type { P2PFrame, P2PSession } from "./p2p-session.js";
-import { AccessUnitAssembler, VIDEO_GCM_AAD, VideoFrameDecoder, parseVideoFrameHeader } from "./video.js";
+import {
+  AccessUnitAssembler,
+  VIDEO_GCM_AAD,
+  VideoFrameDecoder,
+  parseVideoFrameHeader,
+  type VideoFrameHeader,
+} from "./video.js";
 
 /** Data type a station sends a recording's frames on: the binary channel (`0xd1 0x03`), not live video's. */
 export const RECORDING_DATA_TYPE = 3;
 /** Bytes of video frame header; a plaintext frame's H.264 starts here. */
 const VIDEO_HEADER_LEN = 0x16;
+/** Bytes at the start of a standalone recording's encrypted video body that are AES-128-ECB. */
+const STANDALONE_SEALED_BYTES = 128;
 /** Bytes of audio frame header; the 16-byte GCM tag starts here. */
 const AUDIO_HEADER_LEN = 16;
 /** Start of an audio frame's 12-byte GCM nonce. */
@@ -53,9 +74,9 @@ const IDLE_END_MS = 15_000;
 const DEFAULT_TRANSFER_MS = 120_000;
 /**
  * Most frame bytes a transfer holds. The station sends faster than real time, so the time bounds alone do
- * not bound memory; an event recording is far below this.
+ * not bound memory; the longest event recordings measured on a doorbell, about five minutes, are 50 MB.
  */
-export const MAX_TRANSFER_BYTES = 32 * 1024 * 1024;
+export const MAX_TRANSFER_BYTES = 64 * 1024 * 1024;
 
 /** One recording frame as received, in arrival order. */
 export interface RecordingFrame {
@@ -76,6 +97,16 @@ export function homeBase2RecordingPath(channel: number, recording: string): stri
   return `/media/mmcblk0p1/Camera${String(channel).padStart(2, "0")}/${recording}.dat`;
 }
 
+/**
+ * The path a standalone doorbell stores a recording under: its name as `h264_video_yyyyMMdd_HHmmss` in the
+ * doorbell's video directory. Answers `undefined` for any other name. The name is digits behind one fixed
+ * prefix, so the anchored test lets no `..`, slash or other character that could reach another path through.
+ */
+export function standaloneRecordingPath(recording: string): string | undefined {
+  if (!/^h264_video_\d{8}_\d{6}$/.test(recording)) return undefined;
+  return `/mnt/userdata/video/${recording}.data`;
+}
+
 /** One recording transfer on a station session. */
 export interface RecordingTransfer {
   /** The recording's frames, in arrival order. Rejects as {@link receiveRecording} describes. */
@@ -87,7 +118,10 @@ export interface RecordingTransfer {
 /**
  * Request one recording and collect its frames until `CMD_DOWNLOAD_FINISH`. Only frames on
  * {@link RECORDING_DATA_TYPE} tagged with the camera's channel belong to it, so a live stream open on the same
- * station is never mixed in. The finish frame is taken on the camera's channel or channel 0.
+ * station is never mixed in. The finish frame is taken on the camera's channel or channel 0. With `anyChannel`,
+ * recording frames on every channel are kept: a standalone doorbell tags its transfer with a channel of its
+ * own, and a station sends one recording at a time. The station's reply to the request, on the camera's
+ * channel or channel 0, is kept among the frames as the session decoded it.
  *
  * `frames` rejects with {@link RecordingDownloadError}: `no-data` when nothing arrives within
  * {@link FIRST_FRAME_WAIT_MS}, and `incomplete` when the transfer ends without its finish frame, on a
@@ -97,7 +131,14 @@ export interface RecordingTransfer {
  */
 export function receiveRecording(
   session: P2PSession,
-  request: { path: string; accountId: string; channel: number; timeoutMs?: number; signal?: AbortSignal },
+  request: {
+    path: string;
+    accountId: string;
+    channel: number;
+    anyChannel?: boolean;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  },
 ): RecordingTransfer {
   let resolveFrames!: (frames: RecordingFrame[]) => void;
   let rejectFrames!: (error: Error) => void;
@@ -143,7 +184,13 @@ export function receiveRecording(
       else deliver();
       return stop();
     }
-    if (frame.channel !== request.channel) return;
+    if (frame.commandId === CommandType.CMD_DOWNLOAD_VIDEO) {
+      if (frame.channel !== request.channel && frame.channel !== FINISH_CHANNEL) return;
+      if (!draining)
+        collected.push({ commandId: frame.commandId, signCode: frame.signCode, raw: Buffer.from(frame.data) });
+      return;
+    }
+    if (frame.channel !== request.channel && !request.anyChannel) return;
     if (frame.commandId !== CommandType.CMD_VIDEO_FRAME && frame.commandId !== CommandType.CMD_AUDIO_FRAME) return;
     if (frame.dataType !== RECORDING_DATA_TYPE) return;
     received = true;
@@ -211,6 +258,106 @@ export function decodeRecording(frames: readonly RecordingFrame[], eccPrivateKey
   const eccPrivateKey = Buffer.from(eccPrivateKeyHex, "hex");
   if (eccPrivateKey.length !== 32) throw new RecordingDownloadError("undecodable", "the cipher key is not a P-256 key");
   const decoder = new VideoFrameDecoder(eccPrivateKey);
+  return assembleRecording(
+    frames,
+    (_frame, header, payload) => (header.keyframe ? decoder.decodeFrame(payload)?.h264 : plainVideo(header, payload)),
+    (raw) => {
+      const mediaKey = decoder.currentMediaKey;
+      if (!mediaKey || raw.length < AUDIO_BODY_START || raw[5] !== AUDIO_CODEC_AAC_LC) return undefined;
+      const len = raw.readUInt32LE(0);
+      if (raw.length < AUDIO_BODY_START + len) return undefined;
+      return openAudio(
+        mediaKey,
+        raw.subarray(AUDIO_NONCE_START, AUDIO_BODY_START),
+        raw.subarray(AUDIO_HEADER_LEN, AUDIO_NONCE_START),
+        raw.subarray(AUDIO_BODY_START, AUDIO_BODY_START + len),
+      );
+    },
+  );
+}
+
+/**
+ * The key a standalone doorbell seals a downloaded recording's video under: the first 16 bytes of the v1
+ * device key ({@link getImageKey}) for its serial, its station's `p2p_did` and the download code its reply
+ * carries — the derivation a v1 stored image uses with the code in its wrapper.
+ */
+export function standaloneRecordingKey(serialNumber: string, p2pDid: string, code: string): Buffer {
+  return Buffer.from(getImageKey(serialNumber, p2pDid, code), "utf-8").subarray(0, 16);
+}
+
+/**
+ * The download code of a standalone doorbell's reply to the request, among a transfer's frames. Throws
+ * {@link RecordingDownloadError} `key-unavailable` when no reply was kept, when it states a non-zero result,
+ * or when the code is not 10 digits.
+ */
+export function standaloneDownloadCode(frames: readonly RecordingFrame[]): string {
+  const reply = frames.find((f) => f.commandId === CommandType.CMD_DOWNLOAD_VIDEO)?.raw;
+  if (!reply || reply.length < 4) {
+    throw new RecordingDownloadError("key-unavailable", "the station sent no reply carrying the download code");
+  }
+  const result = reply.readInt32LE(0);
+  if (result !== 0) throw new RecordingDownloadError("key-unavailable", `the station answered the download ${result}`);
+  const code = reply.subarray(4).toString("latin1").replace(/\0+$/, "");
+  if (!/^\d{10}$/.test(code)) {
+    throw new RecordingDownloadError("key-unavailable", "the station's reply carries no 10-digit download code");
+  }
+  return code;
+}
+
+/**
+ * Decode a standalone doorbell's recording, in arrival order, into elementary streams, assembled as
+ * {@link decodeRecording} assembles them. A video frame at signCode 1 has the first
+ * {@link STANDALONE_SEALED_BYTES} of its body sealed under {@link standaloneRecordingKey}; one at signCode 0,
+ * and the AAC audio, are plaintext. A sealed body shorter than that is dropped. Rejects with
+ * {@link RecordingDownloadError}: `key-unavailable` as {@link standaloneDownloadCode} does, and `undecodable`
+ * when no video frame decodes.
+ */
+export function decodeStandaloneRecording(
+  frames: readonly RecordingFrame[],
+  serialNumber: string,
+  p2pDid: string,
+): RecordingDownload {
+  const key = standaloneRecordingKey(serialNumber, p2pDid, standaloneDownloadCode(frames));
+  return assembleRecording(
+    frames,
+    (frame, header, payload) => {
+      const body = plainVideo(header, payload);
+      if (!body || frame.signCode === 0) return body;
+      if (body.length < STANDALONE_SEALED_BYTES) return undefined;
+      const decipher = createDecipheriv("aes-128-ecb", key, null);
+      decipher.setAutoPadding(false);
+      const head = Buffer.concat([decipher.update(body.subarray(0, STANDALONE_SEALED_BYTES)), decipher.final()]);
+      return Buffer.concat([head, body.subarray(STANDALONE_SEALED_BYTES)]);
+    },
+    (raw) => {
+      if (raw.length < AUDIO_HEADER_LEN || raw[5] !== AUDIO_CODEC_AAC_LC) return undefined;
+      const len = raw.readUInt32LE(0);
+      return raw.length >= AUDIO_HEADER_LEN + len ? raw.subarray(AUDIO_HEADER_LEN, AUDIO_HEADER_LEN + len) : undefined;
+    },
+  );
+}
+
+/** The H.264 a plaintext video frame carries after its header, or `undefined` when the frame is short. */
+function plainVideo(header: VideoFrameHeader, payload: Buffer): Buffer | undefined {
+  return payload.length >= VIDEO_HEADER_LEN + header.payloadLength
+    ? payload.subarray(VIDEO_HEADER_LEN, VIDEO_HEADER_LEN + header.payloadLength)
+    : undefined;
+}
+
+/**
+ * Assemble a recording's frames, in arrival order, into elementary streams: `openVideo` turns each video
+ * frame into H.264 and `openAudioFrame` each audio frame into AAC, both in arrival order, and either answers
+ * `undefined` to drop the frame. Split pictures are joined through one {@link AccessUnitAssembler}; frames the
+ * camera numbered but that never decoded are counted as missing. A camera that leaves its frame number at one
+ * value for the whole recording, as a T8201 does, numbers nothing: its `frames` and `fps` are counted from the
+ * assembled pictures, and `missingFrames` is 0 because no gap can be seen. Rejects with
+ * {@link RecordingDownloadError} `undecodable` when no video frame decodes.
+ */
+function assembleRecording(
+  frames: readonly RecordingFrame[],
+  openVideo: (frame: RecordingFrame, header: VideoFrameHeader, payload: Buffer) => Buffer | undefined,
+  openAudioFrame: (raw: Buffer) => Buffer | undefined,
+): RecordingDownload {
   const assembler = new AccessUnitAssembler();
   const video: Buffer[] = [];
   const audio: Buffer[] = [];
@@ -218,40 +365,38 @@ export function decodeRecording(frames: readonly RecordingFrame[], eccPrivateKey
   const receivedNumbers = new Set<number>();
   let firstStamp: number | undefined;
   let lastStamp: number | undefined;
-  for (const { commandId, raw } of frames) {
+  let pictures = 0;
+  for (const frame of frames) {
+    const { commandId, raw } = frame;
     if (commandId === CommandType.CMD_VIDEO_FRAME) {
       const header = parseVideoFrameHeader(raw);
       if (!header) continue;
       receivedNumbers.add(header.sequence);
-      const units = assembler.push(raw, (payload) =>
-        header.keyframe
-          ? decoder.decodeFrame(payload)?.h264
-          : payload.length >= VIDEO_HEADER_LEN + header.payloadLength
-            ? payload.subarray(VIDEO_HEADER_LEN, VIDEO_HEADER_LEN + header.payloadLength)
-            : undefined,
-      );
+      const units = assembler.push(raw, (payload) => openVideo(frame, header, payload));
       for (const unit of units) {
         video.push(unit.data);
+        pictures++;
         numbers.add(header.sequence);
         const stamp = raw.readUIntLE(0x0e, 6);
         firstStamp ??= stamp;
         lastStamp = stamp;
       }
     } else if (commandId === CommandType.CMD_AUDIO_FRAME) {
-      const mediaKey = decoder.currentMediaKey;
-      if (!mediaKey || raw.length < AUDIO_BODY_START || raw[5] !== AUDIO_CODEC_AAC_LC) continue;
-      const len = raw.readUInt32LE(0);
-      if (raw.length < AUDIO_BODY_START + len) continue;
-      const aac = openAudio(
-        mediaKey,
-        raw.subarray(AUDIO_NONCE_START, AUDIO_BODY_START),
-        raw.subarray(AUDIO_HEADER_LEN, AUDIO_NONCE_START),
-        raw.subarray(AUDIO_BODY_START, AUDIO_BODY_START + len),
-      );
+      const aac = openAudioFrame(raw);
       if (aac?.length) audio.push(aac);
     }
   }
   if (!video.length) throw new RecordingDownloadError("undecodable", "no video frame of the recording decoded");
+  const durationMs = (lastStamp ?? 0) - (firstStamp ?? 0);
+  const videoAndAudio = {
+    video: Buffer.concat(video),
+    ...(audio.length ? { audio: Buffer.concat(audio) } : {}),
+    durationMs,
+  };
+  if (receivedNumbers.size === 1 && pictures > 1) {
+    const fps = durationMs > 0 ? Math.round(((pictures - 1) * 100_000) / durationMs) / 100 : 0;
+    return { ...videoAndAudio, frames: pictures, missingFrames: 0, fps };
+  }
   const ordered = [...numbers];
   const received = [...receivedNumbers];
   let missingFrames = receivedNumbers.size - numbers.size;
@@ -260,13 +405,10 @@ export function decodeRecording(frames: readonly RecordingFrame[], eccPrivateKey
     if (step > 1 && step < 0x8000) missingFrames += step - 1;
   }
   const span = ordered.length > 1 ? (ordered[ordered.length - 1]! - ordered[0]!) & 0xffff : 0;
-  const durationMs = (lastStamp ?? 0) - (firstStamp ?? 0);
   return {
-    video: Buffer.concat(video),
-    ...(audio.length ? { audio: Buffer.concat(audio) } : {}),
+    ...videoAndAudio,
     frames: ordered.length,
     missingFrames,
-    durationMs,
     fps: durationMs > 0 && span > 0 ? Math.round((span * 100_000) / durationMs) / 100 : 0,
   };
 }

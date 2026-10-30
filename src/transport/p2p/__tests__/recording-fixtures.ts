@@ -62,3 +62,37 @@ export function audioFrame(mediaKey: Buffer, aac: Buffer, codec = 0): RecordingF
 
 export const IDR = Buffer.from("0000000167640028aced0000000168ee3c800000000165b800", "hex");
 export const slice = (n: number) => Buffer.concat([Buffer.from("0000000121", "hex"), Buffer.alloc(40, n)]);
+
+/** A synthetic standalone doorbell: serial, station `p2p_did` and the download code its reply carries. */
+export const STANDALONE = { serial: "T8000P0000000000", p2pDid: "XXXXXXX-000000-XXXXX", code: "0123456789" } as const;
+
+/** A standalone doorbell's reply to the download request: the result, then the code, NUL-padded. */
+export function downloadReply(code: string = STANDALONE.code, result = 0): RecordingFrame {
+  const raw = Buffer.alloc(132);
+  raw.writeInt32LE(result, 0);
+  raw.write(code, 4, "latin1");
+  return { commandId: 1024, signCode: 0, raw };
+}
+
+/** A standalone video frame at signCode 1: the first 128 bytes of `h264` AES-128-ECB under `key`. */
+export function sealedFrame(key: Buffer, h264: Buffer, frameNumber: number, stampMs: number): RecordingFrame {
+  const cipher = createCipheriv("aes-128-ecb", key, null);
+  cipher.setAutoPadding(false);
+  const head = Buffer.concat([cipher.update(h264.subarray(0, 128)), cipher.final()]);
+  return {
+    commandId: 1300,
+    signCode: 1,
+    raw: Buffer.concat([videoHeader(h264.length, true, frameNumber, stampMs), head, h264.subarray(128)]),
+  };
+}
+
+/** A standalone audio frame: the 16-byte header, then the plaintext AAC. */
+export function plainAudioFrame(aac: Buffer, codec = 0): RecordingFrame {
+  const header = Buffer.alloc(16);
+  header.writeUInt32LE(aac.length, 0);
+  header.writeUInt8(codec, 5);
+  return { commandId: 1301, signCode: 0, raw: Buffer.concat([header, aac]) };
+}
+
+/** An IDR access unit long enough that a standalone doorbell seals its first 128 bytes. */
+export const LONG_IDR = Buffer.concat([IDR, Buffer.alloc(200, 0x5a)]);

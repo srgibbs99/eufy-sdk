@@ -491,6 +491,11 @@ export function buildIntStringCommandPayload(
   ]);
 }
 
+/** The plaintext of a string-pair command: five zero bytes, then both strings in {@link stringWithLength} form. */
+export function stringPairBody(strValue: string, strValueSub: string): Buffer {
+  return Buffer.concat([Buffer.alloc(5), stringWithLength(strValue), stringWithLength(strValueSub)]);
+}
+
 /**
  * Build a **string-pair** command body: five zero bytes, then `strValue` and `strValueSub`, each in the
  * 128-byte-chunk length form ({@link stringWithLength}), AES-128-ECB encrypted (level-1) like
@@ -506,7 +511,7 @@ export function buildStringPairCommandPayload(
   encType = 1,
 ): Buffer {
   const encrypted = !!key && key.length === 16;
-  const body = Buffer.concat([Buffer.alloc(5), stringWithLength(strValue), stringWithLength(strValueSub)]);
+  const body = stringPairBody(strValue, strValueSub);
   const data = encrypted ? encryptP2PData(paddingP2PData(body), key!) : body;
   return buildRawCommandPayload(data, channel, encrypted ? encType : 0);
 }

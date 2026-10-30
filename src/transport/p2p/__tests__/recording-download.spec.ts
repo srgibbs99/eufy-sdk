@@ -6,11 +6,26 @@ import {
   MAX_TRANSFER_BYTES,
   RECORDING_DATA_TYPE,
   decodeRecording,
+  decodeStandaloneRecording,
   homeBase2RecordingPath,
   receiveRecording,
+  standaloneRecordingKey,
+  standaloneRecordingPath,
 } from "../recording-download.js";
 import type { P2PSession } from "../p2p-session.js";
-import { IDR, audioFrame, camera, keyframe, plainFrame, slice } from "./recording-fixtures.js";
+import {
+  IDR,
+  LONG_IDR,
+  STANDALONE,
+  audioFrame,
+  camera,
+  downloadReply,
+  keyframe,
+  plainAudioFrame,
+  plainFrame,
+  sealedFrame,
+  slice,
+} from "./recording-fixtures.js";
 
 /** The 7-byte ADTS header of one AAC-LC 16 kHz mono frame of `n` payload bytes, as the camera sends it. */
 const adtsHeader = (n: number) => {
@@ -304,6 +319,124 @@ describe("recording download", () => {
       await transfer.drained;
       expect(session.sent).toEqual([]);
       expect(session.listenerCount("data")).toBe(0);
+    });
+  });
+});
+
+describe("standalone doorbell recording", () => {
+  const KEY = standaloneRecordingKey(STANDALONE.serial, STANDALONE.p2pDid, STANDALONE.code);
+  const decode = (frames: Parameters<typeof decodeStandaloneRecording>[0]) =>
+    decodeStandaloneRecording(frames, STANDALONE.serial, STANDALONE.p2pDid);
+
+  it("builds the doorbell's path from an h264_video recording name, and nothing else", () => {
+    expect(standaloneRecordingPath("h264_video_20260101_120000")).toBe(
+      "/mnt/userdata/video/h264_video_20260101_120000.data",
+    );
+    expect(standaloneRecordingPath("h264_video_20260101_12000")).toBeUndefined();
+    expect(standaloneRecordingPath("h264_video_20260101_120000/../x")).toBeUndefined();
+    expect(standaloneRecordingPath("20260101120000")).toBeUndefined();
+  });
+
+  it("derives the key from the v1 device key's first 16 characters", () => {
+    expect(KEY).toHaveLength(16);
+    expect(KEY.toString("latin1")).toMatch(/^[0-9A-F]{16}$/);
+  });
+
+  it("opens sealed frames with the reply's code, and passes plaintext frames and audio through", () => {
+    const aac = [Buffer.from("fff1504080", "hex"), Buffer.from("fff1504081", "hex")];
+    const out = decode([
+      downloadReply(),
+      sealedFrame(KEY, LONG_IDR, 0, 1_000),
+      plainAudioFrame(aac[0]!),
+      plainFrame(slice(1), 1, 1_067),
+      plainAudioFrame(aac[1]!),
+      plainFrame(slice(2), 2, 1_133),
+    ]);
+
+    expect(out.video).toEqual(Buffer.concat([LONG_IDR, slice(1), slice(2)]));
+    expect(out).toMatchObject({ frames: 3, missingFrames: 0, durationMs: 133 });
+    expect(out.audio).toEqual(Buffer.concat(aac));
+  });
+
+  it("counts pictures when the doorbell leaves every frame number at one value", () => {
+    const out = decode([
+      downloadReply(),
+      sealedFrame(KEY, LONG_IDR, 0, 1_000),
+      plainFrame(slice(1), 0, 1_500),
+      plainFrame(slice(2), 0, 2_000),
+    ]);
+
+    expect(out).toMatchObject({ frames: 3, missingFrames: 0, durationMs: 1_000, fps: 2 });
+  });
+
+  it("answers key-unavailable without a reply, on a refusal, and on a code that is not 10 digits", () => {
+    const video = [sealedFrame(KEY, LONG_IDR, 0, 0)];
+    for (const frames of [
+      video,
+      [downloadReply(STANDALONE.code, -111), ...video],
+      [downloadReply("0".repeat(4)), ...video],
+    ]) {
+      expect(() => decode(frames)).toThrow(expect.objectContaining({ reason: "key-unavailable" }));
+    }
+  });
+
+  it("answers undecodable when the frames were sealed under another code", () => {
+    const other = standaloneRecordingKey(STANDALONE.serial, STANDALONE.p2pDid, "9876543210");
+    expect(() => decode([downloadReply(), sealedFrame(other, LONG_IDR, 0, 0)])).toThrow(
+      expect.objectContaining({ reason: "undecodable" }),
+    );
+  });
+
+  it("drops a sealed frame shorter than the sealed span", () => {
+    const short = sealedFrame(KEY, Buffer.concat([IDR, Buffer.alloc(103)]), 0, 0);
+    short.raw = short.raw.subarray(0, 0x16 + 100);
+    short.raw.writeUInt32LE(100, 0);
+    expect(() => decode([downloadReply(), short])).toThrow(expect.objectContaining({ reason: "undecodable" }));
+  });
+
+  describe("transfer", () => {
+    function station(reply: (session: EventEmitter) => void) {
+      const session = new EventEmitter() as EventEmitter & { sendStringPairCommand: unknown };
+      session.sendStringPairCommand = () => queueMicrotask(() => reply(session));
+      return session as unknown as P2PSession;
+    }
+    const replyFrame = (channel: number) => {
+      const { raw } = downloadReply();
+      return { commandId: 1024, dataType: 0, channel, signCode: 0, raw, data: raw };
+    };
+    const media = (commandId: number, channel: number) => ({
+      commandId,
+      dataType: RECORDING_DATA_TYPE,
+      channel,
+      signCode: 0,
+      raw: Buffer.alloc(30, commandId & 0xff),
+    });
+
+    it("keeps the reply and the frames on the doorbell's own channel with anyChannel", async () => {
+      const session = station((s) => {
+        s.emit("data", replyFrame(0));
+        s.emit("data", media(1300, 1));
+        s.emit("data", media(1301, 1));
+        s.emit("data", { ...media(1300, 1), dataType: 1 });
+        s.emit("data", { commandId: 1304, dataType: 2, channel: 0, signCode: 0, raw: Buffer.alloc(0) });
+      });
+      const frames = await receiveRecording(session, { path: "/p", accountId: "", channel: 0, anyChannel: true })
+        .frames;
+
+      expect(frames.map((f) => f.commandId)).toEqual([1024, 1300, 1301]);
+      expect(frames[0]!.raw.subarray(4, 14).toString("latin1")).toBe(STANDALONE.code);
+    });
+
+    it("keeps only the camera's channel without anyChannel", async () => {
+      const session = station((s) => {
+        s.emit("data", media(1300, 1));
+        s.emit("data", media(1300, 0));
+        s.emit("data", { commandId: 1304, dataType: 2, channel: 0, signCode: 0, raw: Buffer.alloc(0) });
+      });
+      const frames = await receiveRecording(session, { path: "/p", accountId: "", channel: 0 }).frames;
+
+      expect(frames.map((f) => f.raw[0])).toEqual([1300 & 0xff]);
+      expect(frames).toHaveLength(1);
     });
   });
 });

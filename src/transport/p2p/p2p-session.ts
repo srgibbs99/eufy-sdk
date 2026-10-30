@@ -47,6 +47,7 @@ import {
   buildStringCommandPayload,
   buildIntStringCommandPayload,
   buildStringPairCommandPayload,
+  stringPairBody,
   buildVoidCommandPayload,
   decryptP2PData,
   encryptP2PData,
@@ -1526,13 +1527,19 @@ export class P2PSession extends EventEmitter {
     this.send(this.connectAddress, RequestMessageType.DATA, data);
   }
 
-  /** Send a level-1 {@link buildStringPairCommandPayload} command on `channel`. */
+  /**
+   * Send a {@link buildStringPairCommandPayload} command on `channel`: level-1 encrypted, or in the clear with
+   * header bytes from {@link nextClearCommandBytes} on a session that {@link sendsInTheClear} and holds no
+   * level-2 key, as {@link databasePayload} frames a database read. A cipher-0 standalone doorbell answers a
+   * `CMD_DOWNLOAD_VIDEO` only in the clear and ignores the level-1 form.
+   */
   sendStringPairCommand(commandType: number, strValue: string, strValueSub: string, channel: number): void {
     if (!this.connectAddress) throw new Error(`P2P session ${this.cfg.stationSn} is not connected`);
-    const data = Buffer.concat([
-      buildCommandHeader(this.seqNumber, commandType),
-      buildStringPairCommandPayload(strValue, strValueSub, channel, this.level1Key, 1),
-    ]);
+    const payload =
+      !this.level2Key && this.sendsInTheClear()
+        ? buildRawCommandPayload(stringPairBody(strValue, strValueSub), channel, 0, this.nextClearCommandBytes(), 0)
+        : buildStringPairCommandPayload(strValue, strValueSub, channel, this.level1Key, 1);
+    const data = Buffer.concat([buildCommandHeader(this.seqNumber, commandType), payload]);
     this.seqNumber = (this.seqNumber + 1) & 0xffff;
     this.send(this.connectAddress, RequestMessageType.DATA, data);
   }
