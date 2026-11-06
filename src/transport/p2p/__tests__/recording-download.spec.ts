@@ -380,6 +380,21 @@ describe("standalone doorbell recording", () => {
     }
   });
 
+  it("states the shape of a reply whose code is not 10 digits, and never the code", () => {
+    const video = [sealedFrame(KEY, LONG_IDR, 0, 0)];
+    expect(() => decode([downloadReply("12345 789"), downloadReply(), ...video])).toThrow(
+      expect.objectContaining({
+        reason: "key-unavailable",
+        message:
+          "the station's reply carries no 10-digit download code " +
+          "(2 replies, the first 132 bytes: 8 digits, 1 other bytes, 119 trailing NUL bytes)",
+      }),
+    );
+    expect(() => decode([downloadReply("0".repeat(4)), ...video])).toThrow(
+      /\(1 reply, the first 132 bytes: 4 digits, 0/,
+    );
+  });
+
   it("answers undecodable when the frames were sealed under another code", () => {
     const other = standaloneRecordingKey(STANDALONE.serial, STANDALONE.p2pDid, "9876543210");
     expect(() => decode([downloadReply(), sealedFrame(other, LONG_IDR, 0, 0)])).toThrow(

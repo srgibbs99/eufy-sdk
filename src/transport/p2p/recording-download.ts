@@ -70,8 +70,11 @@ const FIRST_FRAME_WAIT_MS = 20_000;
  * `CMD_DOWNLOAD_CANCEL` would close that gap once its wire is captured.
  */
 const IDLE_END_MS = 15_000;
-/** Longest a transfer may run, whatever arrives. */
-const DEFAULT_TRANSFER_MS = 120_000;
+/**
+ * Longest a transfer may run, whatever arrives. A doorbell's five-minute, 47 MB event recording has taken about
+ * 150 s to arrive, about 0.3 MB/s, which puts {@link MAX_TRANSFER_BYTES} at about 220 s.
+ */
+const DEFAULT_TRANSFER_MS = 300_000;
 /**
  * Most frame bytes a transfer holds. The station sends faster than real time, so the time bounds alone do
  * not bound memory; the longest event recordings measured on a doorbell, about five minutes, are 50 MB.
@@ -286,12 +289,15 @@ export function standaloneRecordingKey(serialNumber: string, p2pDid: string, cod
 }
 
 /**
- * The download code of a standalone doorbell's reply to the request, among a transfer's frames. Throws
- * {@link RecordingDownloadError} `key-unavailable` when no reply was kept, when it states a non-zero result,
- * or when the code is not 10 digits.
+ * The download code of a standalone doorbell's reply to the request, among a transfer's frames: the first
+ * reply's text after its result, without trailing NUL bytes. Throws {@link RecordingDownloadError}
+ * `key-unavailable` when no reply was kept, when it states a non-zero result, or when the code is not 10
+ * digits. That last message states how many replies arrived and the first one's shape
+ * ({@link downloadReplyShape}), never the code.
  */
 export function standaloneDownloadCode(frames: readonly RecordingFrame[]): string {
-  const reply = frames.find((f) => f.commandId === CommandType.CMD_DOWNLOAD_VIDEO)?.raw;
+  const replies = frames.filter((f) => f.commandId === CommandType.CMD_DOWNLOAD_VIDEO);
+  const reply = replies[0]?.raw;
   if (!reply || reply.length < 4) {
     throw new RecordingDownloadError("key-unavailable", "the station sent no reply carrying the download code");
   }
@@ -299,9 +305,27 @@ export function standaloneDownloadCode(frames: readonly RecordingFrame[]): strin
   if (result !== 0) throw new RecordingDownloadError("key-unavailable", `the station answered the download ${result}`);
   const code = reply.subarray(4).toString("latin1").replace(/\0+$/, "");
   if (!/^\d{10}$/.test(code)) {
-    throw new RecordingDownloadError("key-unavailable", "the station's reply carries no 10-digit download code");
+    throw new RecordingDownloadError(
+      "key-unavailable",
+      `the station's reply carries no 10-digit download code (${downloadReplyShape(reply, replies.length)})`,
+    );
   }
   return code;
+}
+
+/**
+ * The shape of a download reply as counts only: how many replies arrived, and the first one's length, the
+ * digits and other bytes after its result, and its trailing NUL bytes. The code is key material, so no byte of
+ * it is named.
+ */
+function downloadReplyShape(reply: Buffer, replies: number): string {
+  const body = reply.subarray(4).toString("latin1");
+  const text = body.replace(/\0+$/, "");
+  const digits = text.replace(/\D/g, "").length;
+  return (
+    `${replies} ${replies === 1 ? "reply" : "replies"}, the first ${reply.length} bytes: ` +
+    `${digits} digits, ${text.length - digits} other bytes, ${body.length - text.length} trailing NUL bytes`
+  );
 }
 
 /**
